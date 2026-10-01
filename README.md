@@ -35,12 +35,14 @@ python badge_rotator.py xqc forsen
 ```
 
 ```
-14:02:11 yourname: 243 badges, watching forsen, xqc
-14:02:30 -> Gone Bananas Badge (182 ms)
-14:02:41 -> 007 Gun Barrel (176 ms)
+14:02:11 yourname: 243 badges, 0 shown this cycle, watching forsen, xqc
+14:02:30 -> Gone Bananas Badge (182 ms, 1/243 this cycle)
+14:02:41 -> 007 Gun Barrel (176 ms, 2/243 this cycle)
 ```
 
-Badges are shuffled at startup. Use `--in-order` to cycle them alphabetically.
+Every badge is shown once, in random order, before any of them repeats. Then a new cycle starts. Use `--in-order` to go through them alphabetically instead.
+
+Progress is saved to `.badge_rotator_state.json` next to the script, so stopping and restarting picks the cycle up where it left off. Use `--state-file` to keep it somewhere else.
 
 ## How it works
 

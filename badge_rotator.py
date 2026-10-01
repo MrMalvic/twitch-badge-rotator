@@ -3,7 +3,6 @@
 
 import argparse
 import http.client
-import itertools
 import json
 import logging
 import os
@@ -19,6 +18,7 @@ IRC_HOST = "irc.chat.twitch.tv"
 IRC_PORT = 443
 IRC_IDLE_TIMEOUT = 360
 RECONNECT_DELAY = 5
+DEFAULT_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".badge_rotator_state.json")
 
 log = logging.getLogger("badge-rotator")
 
@@ -64,11 +64,58 @@ class GQLClient:
         return resp.status, resp.read()
 
 
-def fetch_badges(gql):
-    user = gql.query("{ currentUser { login availableBadges { setID version title } } }")["currentUser"]
+def badge_key(badge):
+    return f"{badge['setID']};{badge['version']}"
+
+
+def fetch_account(gql):
+    user = gql.query(
+        "{ currentUser { login availableBadges { setID version title } selectedBadge { setID version } } }"
+    )["currentUser"]
     if not user:
         raise AuthError("token is not attached to a logged-in account")
-    return user["login"], user["availableBadges"]
+    selected = user["selectedBadge"]
+    return user["login"], user["availableBadges"], selected and badge_key(selected)
+
+
+class Rotation:
+    def __init__(self, badges, shown=(), current=None, in_order=False):
+        self.badges = sorted(badges, key=lambda b: b["title"].lower()) if in_order else list(badges)
+        owned = {badge_key(b) for b in self.badges}
+        self.shown = {key for key in shown if key in owned}
+        self.current = current
+        self.in_order = in_order
+
+    def __len__(self):
+        return len(self.badges)
+
+    def next(self):
+        pool = [b for b in self.badges if badge_key(b) not in self.shown]
+        if not pool:
+            self.shown.clear()
+            pool = [b for b in self.badges if badge_key(b) != self.current] or self.badges
+        return pool[0] if self.in_order else random.choice(pool)
+
+    def mark_shown(self, badge):
+        self.current = badge_key(badge)
+        self.shown.add(self.current)
+
+
+def read_state(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(path, login, rotation):
+    state = read_state(path)
+    state[login] = {"shown": sorted(rotation.shown), "current": rotation.current}
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
 
 
 def select_badge(gql, badge):
@@ -115,12 +162,11 @@ def watch(channels):
             time.sleep(RECONNECT_DELAY)
 
 
-def rotate(gql, login, badges, channels):
-    rotation = itertools.cycle(badges)
+def rotate(gql, login, rotation, channels, state_file):
     for sender in watch(channels):
         if sender != login:
             continue
-        badge = next(rotation)
+        badge = rotation.next()
         started = time.perf_counter()
         try:
             select_badge(gql, badge)
@@ -129,13 +175,22 @@ def rotate(gql, login, badges, channels):
         except (TwitchError, OSError) as e:
             log.warning("could not switch to %s: %s", badge["title"], e)
             continue
-        log.info("-> %s (%.0f ms)", badge["title"], (time.perf_counter() - started) * 1000)
+        elapsed = (time.perf_counter() - started) * 1000
+        rotation.mark_shown(badge)
+        log.info("-> %s (%.0f ms, %d/%d this cycle)", badge["title"], elapsed, len(rotation.shown), len(rotation))
+        try:
+            save_state(state_file, login, rotation)
+        except OSError as e:
+            log.warning("could not save progress to %s: %s", state_file, e)
 
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("channels", nargs="+", help="channels to watch for your messages")
-    parser.add_argument("--in-order", action="store_true", help="cycle badges alphabetically instead of shuffled")
+    parser.add_argument("--in-order", action="store_true", help="cycle badges alphabetically instead of randomly")
+    parser.add_argument(
+        "--state-file", default=DEFAULT_STATE_FILE, help="where to keep cycle progress (default: next to the script)"
+    )
     args = parser.parse_args(argv)
     args.channels = sorted({c.lstrip("#").lower() for c in args.channels})
     args.token = os.environ.get("TWITCH_AUTH_TOKEN", "").strip().strip('"')
@@ -149,13 +204,16 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     gql = GQLClient(args.token)
     try:
-        login, badges = fetch_badges(gql)
+        login, badges, selected = fetch_account(gql)
         if not badges:
             sys.exit(f"{login} has no global badges to rotate")
-        if not args.in_order:
-            random.shuffle(badges)
-        log.info("%s: %d badges, watching %s", login, len(badges), ", ".join(args.channels))
-        rotate(gql, login, badges, args.channels)
+        saved = read_state(args.state_file).get(login, {})
+        rotation = Rotation(badges, saved.get("shown", ()), selected, args.in_order)
+        log.info(
+            "%s: %d badges, %d shown this cycle, watching %s",
+            login, len(rotation), len(rotation.shown), ", ".join(args.channels),
+        )
+        rotate(gql, login, rotation, args.channels, args.state_file)
     except TwitchError as e:
         sys.exit(f"error: {e}")
     except KeyboardInterrupt:
